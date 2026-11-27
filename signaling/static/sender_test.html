@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>테스트 송신</title>
+<style>
+  body { margin: 0; padding: 16px; background: #111; color: #ddd; font-family: system-ui, sans-serif; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 8px; }
+  video { width: 100%; max-width: 640px; background: #000; display: block; margin-top: 12px; }
+  button, select { padding: 6px 12px; font-size: 14px; }
+  .note { color: #c96; font-size: 13px; }
+  #stats { font: 12px/1.5 ui-monospace, monospace; white-space: pre; margin-top: 12px; color: #8cf; }
+  #log { font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; margin-top: 12px; color: #9a9; }
+</style>
+</head>
+<body>
+<h3>테스트 송신 (C++ 송신기 대신 브라우저로 시그널링·뷰어 확인용)</h3>
+
+<div class="row">
+  <label>모드
+    <select id="mode">
+      <option value="detail" selected>화질 우선 (글씨·유튜브)</option>
+      <option value="motion">fps 우선 (게임)</option>
+    </select>
+  </label>
+  <label>fps <select id="fps"><option>30</option><option selected>60</option><option>120</option></select></label>
+  <label>비트레이트
+    <select id="bitrate">
+      <option value="4">4 Mbps</option>
+      <option value="8">8 Mbps</option>
+      <option value="15" selected>15 Mbps</option>
+      <option value="30">30 Mbps</option>
+    </select>
+  </label>
+  <label>코덱
+    <select id="codec">
+      <option value="H264" selected>H.264</option>
+      <option value="VP9">VP9</option>
+      <option value="AV1">AV1</option>
+    </select>
+  </label>
+</div>
+<div class="row">
+  <button id="start">공유 시작</button>
+  <button id="stop" disabled>중지</button>
+  <label><input type="checkbox" id="showPreview"> 미리보기 표시</label>
+  <span id="viewerCount">시청자 0명</span>
+</div>
+<div class="note">※ 이 탭이 아닌 다른 탭이나 창을 공유하세요. 이 탭을 공유하면 화면이 겹쳐서 흔들립니다.</div>
+
+<div id="stats"></div>
+<video id="preview" autoplay playsinline muted style="display:none"></video>
+<div id="log"></div>
+
+<script>
+const room = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || '');
+const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+let ws = null;
+let stream = null;
+const peers = new Map(); // viewerId -> RTCPeerConnection
+
+const $ = (id) => document.getElementById(id);
+function log(t) { $('log').textContent = `[${new Date().toLocaleTimeString()}] ${t}\n` + $('log').textContent; }
+function send(msg) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
+function updateCount() { $('viewerCount').textContent = `시청자 ${peers.size}명`; }
+
+function bitrateBps() { return Number($('bitrate').value) * 1_000_000; }
+
+function preferCodec(transceiver, mime) {
+  if (!RTCRtpReceiver.getCapabilities || !transceiver.setCodecPreferences) return;
+  const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
+  const want = codecs.filter(c => c.mimeType === 'video/' + mime);
+  const rest = codecs.filter(c => c.mimeType !== 'video/' + mime);
+  if (want.length) transceiver.setCodecPreferences([...want, ...rest]);
+  else log(`${mime} 코덱을 이 브라우저가 지원하지 않아 기본 코덱을 씁니다`);
+}
+
+// WebRTC는 낮은 비트레이트로 시작해서 천천히 올리기 때문에 처음 몇 초가 흐리다.
+// answer의 비디오 fmtp에 Chrome 전용 시작/최소 비트레이트 힌트를 붙여 초반 화질을 끌어올린다.
+function boostBitrate(sdp) {
+  const maxKbps = Math.round(bitrateBps() / 1000);
+  const startKbps = Math.round(maxKbps * 0.7);
+  const minKbps = Math.round(maxKbps * 0.3);
+  const hint = `x-google-start-bitrate=${startKbps};x-google-min-bitrate=${minKbps};x-google-max-bitrate=${maxKbps}`;
+  let inVideo = false;
+  return sdp.split('\r\n').map((line) => {
+    if (line.startsWith('m=')) inVideo = line.startsWith('m=video');
+    if (inVideo && line.startsWith('a=fmtp:') && !line.includes('apt=') && !line.includes('x-google-')) {
+      return line + ';' + hint;
+    }
+    return line;
+  }).join('\r\n');
+}
+
+async function addViewer(viewerId) {
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  peers.set(viewerId, pc);
+  updateCount();
+
+  const detail = $('mode').value === 'detail';
+  for (const track of stream.getTracks()) {
+    const tr = pc.addTransceiver(track, { direction: 'sendonly', streams: [stream] });
+    if (track.kind === 'video') {
+      preferCodec(tr, $('codec').value);
+      const params = tr.sender.getParameters();
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+      params.encodings[0].maxBitrate = bitrateBps();
+      params.encodings[0].maxFramerate = Number($('fps').value);
+      params.encodings[0].scaleResolutionDownBy = 1;
+      // 화질 우선이면 해상도를 지키고 fps를 낮춘다. fps 우선이면 그 반대.
+      params.degradationPreference = detail ? 'maintain-resolution' : 'maintain-framerate';
+      tr.sender.setParameters(params).catch(e => log('setParameters 실패: ' + e.message));
+    }
+  }
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) send({ type: 'candidate', to: viewerId, candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid });
+  };
+  pc.onconnectionstatechange = () => log(`${viewerId}: ${pc.connectionState}`);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send({ type: 'offer', to: viewerId, sdp: pc.localDescription.sdp });
+  log(`${viewerId} 입장 → offer 전송`);
+}
+
+function removeViewer(viewerId) {
+  const pc = peers.get(viewerId);
+  if (pc) pc.close();
+  peers.delete(viewerId);
+  updateCount();
+  log(`${viewerId} 퇴장`);
+}
+
+// 송신 측 통계: 실제로 나가는 해상도/fps와, 화질이 깎인 이유(cpu/bandwidth)를 보여준다
+const LIMIT_REASON = { none: '없음', cpu: 'CPU 부족', bandwidth: '대역폭 부족', other: '기타' };
+let lastBytes = 0, lastTs = 0;
+setInterval(async () => {
+  const pc = peers.values().next().value;
+  if (!pc) { $('stats').textContent = ''; return; }
+  const report = await pc.getStats();
+  let out = null, codecs = {}, pair = null;
+  report.forEach((s) => {
+    if (s.type === 'outbound-rtp' && s.kind === 'video') out = s;
+    if (s.type === 'codec') codecs[s.id] = s;
+    if (s.type === 'candidate-pair' && s.nominated) pair = s;
+  });
+  if (!out) return;
+  const kbps = lastTs ? ((out.bytesSent - lastBytes) * 8) / (out.timestamp - lastTs) : 0;
+  lastBytes = out.bytesSent; lastTs = out.timestamp;
+  const track = stream?.getVideoTracks()[0]?.getSettings() ?? {};
+  $('stats').textContent =
+    `캡처 원본   ${track.width ?? '-'}x${track.height ?? '-'} @ ${Math.round(track.frameRate ?? 0)}fps\n` +
+    `실제 송신   ${out.frameWidth ?? '-'}x${out.frameHeight ?? '-'} @ ${out.framesPerSecond ?? '-'}fps\n` +
+    `비트레이트  ${(kbps / 1000).toFixed(2)} Mbps  (대역폭 추정 ${pair?.availableOutgoingBitrate ? (pair.availableOutgoingBitrate / 1e6).toFixed(1) : '-'} Mbps)\n` +
+    `코덱        ${codecs[out.codecId]?.mimeType ?? '?'}  인코더 ${out.encoderImplementation ?? '?'}\n` +
+    `화질 제한   ${LIMIT_REASON[out.qualityLimitationReason] ?? out.qualityLimitationReason ?? '-'}`;
+}, 1000);
+
+$('showPreview').onchange = (e) => { $('preview').style.display = e.target.checked ? 'block' : 'none'; };
+
+$('start').onclick = async () => {
+  if (!room) { log('주소에 방 이름이 없습니다 (/send/방이름)'); return; }
+  const fps = Number($('fps').value);
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: fps }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+      audio: true,
+      selfBrowserSurface: 'exclude', // 이 탭은 공유 목록에서 빼기 (지원 브라우저만)
+    });
+  } catch (e) { log('화면 선택 취소/실패: ' + e.message); return; }
+
+  const vt = stream.getVideoTracks()[0];
+  vt.contentHint = $('mode').value === 'detail' ? 'detail' : 'motion';
+  vt.onended = stop;
+  $('preview').srcObject = stream;
+
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => send({ type: 'join', role: 'sender', room });
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    switch (msg.type) {
+      case 'joined': log(`방 "${room}" 송신 시작 — 시청 주소: ${location.origin}/view/${encodeURIComponent(room)}`); break;
+      case 'viewer-joined': await addViewer(msg.viewer); break;
+      case 'viewer-left': removeViewer(msg.viewer); break;
+      case 'answer': await peers.get(msg.from)?.setRemoteDescription({ type: 'answer', sdp: boostBitrate(msg.sdp) }); break;
+      case 'candidate': await peers.get(msg.from)?.addIceCandidate({ candidate: msg.candidate, sdpMid: msg.sdpMid ?? '0' }).catch(console.warn); break;
+      case 'error': log('서버 오류: ' + msg.message); break;
+    }
+  };
+  ws.onclose = () => log('서버 연결 종료');
+
+  for (const id of ['start', 'mode', 'fps', 'bitrate', 'codec']) $(id).disabled = true;
+  $('stop').disabled = false;
+};
+
+function stop() {
+  for (const id of [...peers.keys()]) removeViewer(id);
+  if (ws) ws.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  ws = null; stream = null; lastBytes = 0; lastTs = 0;
+  $('preview').srcObject = null;
+  for (const id of ['start', 'mode', 'fps', 'bitrate', 'codec']) $(id).disabled = false;
+  $('stop').disabled = true;
+}
+$('stop').onclick = stop;
+</script>
+</body>
+</html>

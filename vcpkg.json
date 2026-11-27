@@ -1,0 +1,12 @@
+{
+  "name": "screenshare",
+  "version": "0.1.0",
+  "dependencies": [
+    {
+      "name": "libdatachannel",
+      "features": [ "ws", "srtp" ]
+    },
+    "nlohmann-json",
+    "opus"
+  ]
+}

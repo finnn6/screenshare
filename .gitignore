@@ -1,0 +1,14 @@
+# 빌드 결과
+build/
+
+# 파이썬
+.venv/
+__pycache__/
+*.pyc
+
+# 진단 모드 출력
+*.h264
+*.wav
+
+# 편집기
+.vscode/

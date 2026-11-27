@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>화면공유 보기</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font-family: system-ui, sans-serif; }
+  #wrap { position: relative; width: 100%; height: 100%; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #status { position: absolute; top: 12px; left: 12px; padding: 6px 10px; background: rgba(0,0,0,.6); border-radius: 6px; font-size: 14px; }
+  #stats { position: absolute; top: 12px; right: 12px; padding: 6px 10px; background: rgba(0,0,0,.6); border-radius: 6px; font: 12px/1.5 ui-monospace, monospace; white-space: pre; display: none; }
+  #controls { position: absolute; bottom: 12px; left: 12px; display: flex; gap: 8px; }
+  button { padding: 6px 12px; border: 0; border-radius: 6px; background: rgba(255,255,255,.15); color: #fff; cursor: pointer; font-size: 14px; }
+  button:hover { background: rgba(255,255,255,.3); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="status">준비 중</div>
+  <div id="stats"></div>
+  <div id="controls">
+    <button id="takeover" hidden>이 탭에서 보기</button>
+    <button id="unmute">소리 켜기</button>
+    <button id="toggleStats">통계</button>
+    <button id="fullscreen">전체화면</button>
+  </div>
+</div>
+
+<script>
+const room = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || '');
+const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+const video = document.getElementById('video');
+const statusEl = document.getElementById('status');
+const statsEl = document.getElementById('stats');
+
+let ws = null;
+let pc = null;
+let pendingCandidates = [];
+let remoteStream = null;
+
+function setStatus(text) { statusEl.textContent = text; }
+function send(msg) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
+
+function closePc() {
+  if (pc) { pc.close(); pc = null; }
+  pendingCandidates = [];
+  remoteStream = null;
+  video.srcObject = null;
+}
+
+function createPc() {
+  const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  remoteStream = new MediaStream();
+  video.srcObject = remoteStream;
+
+  conn.ontrack = (e) => {
+    remoteStream.addTrack(e.track);
+    // 지연 최소화: 지터 버퍼 목표를 0으로 (지원하는 브라우저만)
+    try { e.receiver.jitterBufferTarget = 0; } catch (_) {}
+    try { e.receiver.playoutDelayHint = 0; } catch (_) {}
+  };
+  conn.onicecandidate = (e) => {
+    if (e.candidate) {
+      send({ type: 'candidate', candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid });
+    }
+  };
+  conn.onconnectionstatechange = () => {
+    const s = conn.connectionState;
+    if (s === 'connected') setStatus('시청 중');
+    else if (s === 'connecting') setStatus('연결 중...');
+    else if (s === 'failed') setStatus('연결 실패');
+    else if (s === 'disconnected') setStatus('연결 끊김');
+  };
+  return conn;
+}
+
+async function handleOffer(msg) {
+  closePc();
+  pc = createPc();
+  await pc.setRemoteDescription({ type: 'offer', sdp: NO_SYNC ? splitAudioStream(msg.sdp) : msg.sdp });
+  for (const c of pendingCandidates) await pc.addIceCandidate(c).catch(console.warn);
+  pendingCandidates = [];
+  const answer = await pc.createAnswer();
+  answer.sdp = enableOpusStereo(answer.sdp);
+  await pc.setLocalDescription(answer);
+  send({ type: 'answer', sdp: pc.localDescription.sdp });
+}
+
+// 진단용: 주소에 ?nosync 를 붙이면 소리를 영상과 다른 스트림으로 받아서 싱크(립싱크)를 끈다
+const NO_SYNC = new URLSearchParams(location.search).has('nosync');
+function splitAudioStream(sdp) {
+  return sdp.split(/(?=\r\nm=)/).map((sec) =>
+    sec.startsWith('\r\nm=audio') ? sec.replace(/msid:screen(?=\s)/g, 'msid:screen-audio') : sec
+  ).join('');
+}
+
+// Chrome은 응답 SDP에 stereo=1이 없으면 Opus를 모노로 디코딩한다 → 직접 넣어 준다
+function enableOpusStereo(sdp) {
+  const m = sdp.match(/a=rtpmap:(\d+) opus\/48000[^\r\n]*/i);
+  if (!m) return sdp;
+  const pt = m[1];
+  const fmtp = new RegExp(`a=fmtp:${pt} ([^\\r\\n]*)`);
+  if (fmtp.test(sdp)) {
+    return sdp.replace(fmtp, (line, params) => params.includes('stereo=1') ? line : `a=fmtp:${pt} ${params};stereo=1`);
+  }
+  return sdp.replace(m[0], `${m[0]}\r\na=fmtp:${pt} stereo=1`);
+}
+
+async function handleCandidate(msg) {
+  const cand = { candidate: msg.candidate, sdpMid: msg.sdpMid ?? '0' };
+  if (pc && pc.remoteDescription) await pc.addIceCandidate(cand).catch(console.warn);
+  else pendingCandidates.push(cand);
+}
+
+// ---- 한 브라우저에서는 한 탭만 시청 ----
+// 같은 방을 여러 탭에서 열면 가장 최근에 시작한 탭만 연결을 유지한다.
+// 밀려난 탭은 화면만 숨기지 않고 연결까지 끊는다 (송신기가 그 탭에 보내지 않도록).
+// BroadcastChannel은 같은 브라우저 안에서만 통하므로 다른 브라우저·시크릿 창·다른 기기는 막지 않는다.
+const takeoverBtn = document.getElementById('takeover');
+const tabId = Math.random().toString(36).slice(2);
+const tabChannel = window.BroadcastChannel ? new BroadcastChannel('screen-view:' + room) : null;
+let active = false;
+let claimedAt = 0;
+let reconnectTimer = null;
+
+function startViewing() {
+  active = true;
+  claimedAt = Date.now();
+  takeoverBtn.hidden = true;
+  tabChannel?.postMessage({ id: tabId, at: claimedAt });
+  connect();
+}
+
+function stopViewing() {
+  active = false;
+  clearTimeout(reconnectTimer);
+  if (ws) {
+    ws.onopen = ws.onmessage = ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
+  closePc();
+  statsEl.textContent = '';
+  takeoverBtn.hidden = false;
+  setStatus('다른 탭에서 보고 있어요');
+}
+
+if (tabChannel) {
+  tabChannel.onmessage = ({ data }) => {
+    // 두 탭이 거의 동시에 시작해도 둘 다 꺼지지 않도록, 나보다 늦게 시작한 탭에만 양보한다
+    const newer = data.at > claimedAt || (data.at === claimedAt && data.id > tabId);
+    if (active && newer) stopViewing();
+  };
+}
+takeoverBtn.onclick = startViewing;
+
+function connect() {
+  if (!room) { setStatus('주소에 방 이름이 없습니다 (/view/방이름)'); return; }
+  setStatus('서버 연결 중...');
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => send({ type: 'join', role: 'viewer', room });
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    try {
+      switch (msg.type) {
+        case 'joined':
+          setStatus(msg.senderOnline ? '연결 중...' : '방송 대기 중');
+          break;
+        case 'sender-joined':
+          setStatus('연결 중...');
+          break;
+        case 'offer':
+          await handleOffer(msg);
+          break;
+        case 'candidate':
+          await handleCandidate(msg);
+          break;
+        case 'sender-left':
+          closePc();
+          setStatus('방송 종료됨 — 다시 시작하면 자동으로 연결됩니다');
+          break;
+        case 'error':
+          console.warn('server error:', msg.message);
+          setStatus('오류: ' + msg.message);
+          break;
+      }
+    } catch (err) {
+      if (!active) return;   // 처리 중에 다른 탭에 밀려난 경우
+      console.error(err);
+      setStatus('처리 오류: ' + err.message);
+    }
+  };
+
+  ws.onclose = () => {
+    closePc();
+    setStatus('서버 연결 끊김 — 재연결 중...');
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+}
+
+// ---- 통계 (해상도 / fps / 비트레이트 / 코덱 / 지연) ----
+// 지연 항목은 누적값의 1초 간 차이로 평균을 낸다.
+//  지터버퍼 = 패킷이 도착해서 디코더에 넘어가기까지 버퍼에서 기다린 시간 (jitterBufferDelay / jitterBufferEmittedCount)
+//  디코드   = 프레임 하나 디코딩에 걸린 시간 (totalDecodeTime / framesDecoded)
+//  후처리   = 프레임 완성 후 화면에 내보내기까지 (totalProcessingDelay / framesDecoded, Chrome)
+//  RTT      = 송신기↔뷰어 왕복 시간 (candidate-pair currentRoundTripTime)
+let prev = null;
+const log = [];            // 1초마다 쌓아서 콘솔에서 copy(JSON.stringify(log)) 로 꺼낼 수 있음
+window.latencyLog = log;
+if (new URLSearchParams(location.search).has('stats')) statsEl.style.display = 'block';
+
+setInterval(async () => {
+  if (!pc || statsEl.style.display === 'none') return;
+  const report = await pc.getStats();
+  let inbound = null, audioIn = null, pair = null;
+  const codecs = {};
+  report.forEach((s) => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') inbound = s;
+    if (s.type === 'inbound-rtp' && s.kind === 'audio') audioIn = s;
+    if (s.type === 'codec') codecs[s.id] = s;
+    if (s.type === 'candidate-pair' && s.state === 'succeeded' && (s.nominated || s.selected)) pair = s;
+  });
+  if (!inbound) return;
+
+  const cur = {
+    ts: inbound.timestamp, bytes: inbound.bytesReceived,
+    jbDelay: inbound.jitterBufferDelay ?? 0, jbCount: inbound.jitterBufferEmittedCount ?? 0,
+    decTime: inbound.totalDecodeTime ?? 0, decFrames: inbound.framesDecoded ?? 0,
+    procDelay: inbound.totalProcessingDelay ?? 0,
+    lost: inbound.packetsLost ?? 0, nack: inbound.nackCount ?? 0, pli: inbound.pliCount ?? 0,
+    jbTarget: inbound.jitterBufferTargetDelay ?? 0,
+    aJbDelay: audioIn?.jitterBufferDelay ?? 0, aJbCount: audioIn?.jitterBufferEmittedCount ?? 0,
+    aJbTarget: audioIn?.jitterBufferTargetDelay ?? 0, aJbMin: audioIn?.jitterBufferMinimumDelay ?? 0,
+    aLost: audioIn?.packetsLost ?? 0, aDiscarded: audioIn?.packetsDiscarded ?? 0,
+    aSamples: audioIn?.totalSamplesReceived ?? 0, aConcealed: audioIn?.concealedSamples ?? 0,
+    aAccel: audioIn?.removedSamplesForAcceleration ?? 0, aDecel: audioIn?.insertedSamplesForDeceleration ?? 0,
+  };
+  const d = (k) => prev ? cur[k] - prev[k] : 0;
+  const kbps = prev ? (d('bytes') * 8) / (cur.ts - prev.ts) : 0;
+  const per = (num, den) => den > 0 ? (num / den) * 1000 : NaN;   // 초 → ms
+  const jb   = per(d('jbDelay'), d('jbCount'));
+  const dec  = per(d('decTime'), d('decFrames'));
+  const proc = per(d('procDelay'), d('decFrames'));
+  const ajb  = per(d('aJbDelay'), d('aJbCount'));   // 소리 지터버퍼 (샘플 단위라 비율은 같음)
+  const jbt  = per(d('jbTarget'), d('jbCount'));     // 브라우저가 정한 목표 지연
+  const ajbt = per(d('aJbTarget'), d('aJbCount'));
+  const ajbm = per(d('aJbMin'), d('aJbCount'));      // 싱크·설정을 빼고 네트워크만 보고 정한 최소 지연
+  const pctOf = (k) => d('aSamples') > 0 ? (d(k) / d('aSamples') * 100) : NaN;   // 1초 동안 받은 샘플 대비 %
+  const rtt  = pair?.currentRoundTripTime != null ? pair.currentRoundTripTime * 1000 : NaN;
+  const f = (v) => Number.isFinite(v) ? v.toFixed(1) : '-';
+  prev = cur;
+
+  const codec = codecs[inbound.codecId]?.mimeType ?? '?';
+  statsEl.textContent =
+    `해상도  ${inbound.frameWidth ?? '-'}x${inbound.frameHeight ?? '-'}\n` +
+    `fps     ${inbound.framesPerSecond ?? '-'}\n` +
+    `비트    ${(kbps / 1000).toFixed(2)} Mbps\n` +
+    `코덱    ${codec}\n` +
+    `손실    ${cur.lost} pkts (NACK ${cur.nack}, PLI ${cur.pli})\n` +
+    `드롭    ${inbound.framesDropped ?? 0} frames\n` +
+    `--- 지연 (ms) ---\n` +
+    `지터버퍼 ${f(jb)} (목표 ${f(jbt)})\n` +
+    `디코드   ${f(dec)}\n` +
+    `후처리   ${f(proc)}\n` +
+    `RTT      ${f(rtt)}\n` +
+    `--- 소리 ---\n` +
+    `지터버퍼 ${audioIn ? f(ajb) : '없음'} ms (목표 ${f(ajbt)}, 최소 ${f(ajbm)})\n` +
+    `도착흔들림 ${audioIn?.jitter != null ? f(audioIn.jitter * 1000) : '-'} ms\n` +
+    `빠르게재생 ${f(pctOf('aAccel'))}% | 늘려재생 ${f(pctOf('aDecel'))}% | 메움 ${f(pctOf('aConcealed'))}%\n` +
+    `손실     ${cur.aLost} pkts | 버림 ${cur.aDiscarded}`;
+  log.push({ t: Date.now(), fps: inbound.framesPerSecond, mbps: kbps / 1000, jitterBufferMs: jb, decodeMs: dec,
+             processingMs: proc, rttMs: rtt, audioJitterBufferMs: ajb, audioTargetMs: ajbt, audioMinMs: ajbm,
+             audioArrivalJitterMs: audioIn?.jitter != null ? audioIn.jitter * 1000 : NaN,
+             audioAccelPct: pctOf('aAccel'), audioDecelPct: pctOf('aDecel'), audioConcealPct: pctOf('aConcealed'), lost: cur.lost, nack: cur.nack, pli: cur.pli });
+}, 1000);
+
+document.getElementById('unmute').onclick = (e) => {
+  video.muted = !video.muted;
+  e.target.textContent = video.muted ? '소리 켜기' : '소리 끄기';
+};
+document.getElementById('toggleStats').onclick = () => {
+  statsEl.style.display = statsEl.style.display === 'block' ? 'none' : 'block';
+};
+document.getElementById('fullscreen').onclick = () => document.getElementById('wrap').requestFullscreen?.();
+video.ondblclick = () => document.getElementById('wrap').requestFullscreen?.();
+
+startViewing();
+</script>
+</body>
+</html>

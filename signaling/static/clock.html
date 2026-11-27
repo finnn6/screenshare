@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>지연 측정용 시계</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #0f0; display: flex; align-items: center; justify-content: center; }
+  #t { font: 700 14vw/1 ui-monospace, Consolas, monospace; }
+  #hint { position: fixed; bottom: 8px; left: 12px; color: #888; font: 12px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<div id="t">0.000</div>
+<div id="hint">화면공유 대상으로 이 창을 공유하고, 뷰어 화면과 나란히 찍어서 두 시계의 차이를 읽는다 (초 단위, 소수점 3자리)</div>
+<script>
+// 화면 주사율마다 갱신. performance.now() 기준 초 (리로드하면 0부터)
+const el = document.getElementById('t');
+function tick() { el.textContent = (performance.now() / 1000).toFixed(3); requestAnimationFrame(tick); }
+tick();
+</script>
+</body>
+</html>
